@@ -49,6 +49,44 @@ except (ImportError, KeyError, OSError):
 DEBUG = False
 _DEFAULT_AUTH_PLUGIN = None  # if this is not None, use it instead of server's default.
 
+
+class LocalInfileSource:
+    """A scoped upload source for ``LOAD DATA LOCAL INFILE``.
+
+    Binds an opaque *name* to a binary stream or a one-shot iterator of
+    ``bytes`` chunks.  Pass an instance to ``Cursor.execute()`` (or
+    ``Connection.query()``) via the ``local_infile_source`` parameter to
+    authorize exactly one upload: the server's ``LOCAL INFILE`` request is
+    served from ``source`` only when the requested file name matches
+    ``name``.  The authorization is valid for that single execution only
+    and is never used as a fallback for other requests, so enabling it
+    does not allow the server to read arbitrary files from this host.
+
+    :param name: Opaque identifier (``str`` or ``bytes``) that the server
+        must request.  ``str`` is encoded with the connection's encoding.
+    :param source: A binary file-like object (with a ``read()`` method) or
+        an iterable yielding ``bytes`` chunks.  The source is consumed at
+        most once per execution.
+    """
+
+    def __init__(self, name, source):
+        if not isinstance(name, (str, bytes)):
+            raise TypeError("name must be str or bytes")
+        self.name = name
+        self.source = source
+
+
+class _LocalInfileAuthorization:
+    """Per-execution state for an authorized LOCAL INFILE upload."""
+
+    __slots__ = ("name", "source", "used")
+
+    def __init__(self, name: bytes, source):
+        self.name = name
+        self.source = source
+        self.used = False
+
+
 TEXT_TYPES = {
     FIELD_TYPE.BIT,
     FIELD_TYPE.BLOB,
@@ -148,6 +186,8 @@ class Connection:
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
     :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
+        See :class:`LocalInfileSource` for a way to authorize a single
+        in-memory upload instead of letting the server name a file path.
     :param max_allowed_packet: Max size of packet sent to server in bytes. (default: 16MB)
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
@@ -342,6 +382,9 @@ class Connection:
         self._result = None
         self._affected_rows = 0
         self.host_info = "Not connected"
+        # Per-execution LOAD DATA LOCAL INFILE upload authorization,
+        # set by query() while a local_infile_source is in effect.
+        self._local_infile_auth = None
 
         # specified autocommit mode. None means use server default.
         self.autocommit_mode = autocommit
@@ -572,13 +615,30 @@ class Connection:
         return self.cursorclass(self)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
-    def query(self, sql, unbuffered=False):
+    def query(self, sql, unbuffered=False, local_infile_source=None):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
-        self._execute_command(COMMAND.COM_QUERY, sql)
-        self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        if local_infile_source is None:
+            self._execute_command(COMMAND.COM_QUERY, sql)
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+            return self._affected_rows
+        if not isinstance(local_infile_source, LocalInfileSource):
+            raise TypeError("local_infile_source must be a pymysql.LocalInfileSource")
+        name = local_infile_source.name
+        if isinstance(name, str):
+            name = name.encode(self.encoding)
+        self._local_infile_auth = _LocalInfileAuthorization(
+            name, local_infile_source.source
+        )
+        try:
+            self._execute_command(COMMAND.COM_QUERY, sql)
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        finally:
+            # The authorization is scoped to this execution; it must not
+            # leak into the next statement (e.g. from a connection pool).
+            self._local_infile_auth = None
         return self._affected_rows
 
     def next_result(self, unbuffered=False):
@@ -1334,13 +1394,9 @@ class MySQLResult:
 
     def _read_load_local_packet(self, first_packet):
         conn: Connection = self.connection
-        if not conn._local_infile:
-            raise RuntimeError(
-                "**WARN**: Received LOAD_LOCAL packet but local_infile option is false."
-            )
         load_packet = LoadLocalPacketWrapper(first_packet)
         try:
-            _send_local_file(load_packet.filename, conn)
+            _send_local_data(load_packet.filename, conn)
         finally:
             # send the empty packet to signify we are done sending data
             conn.write_packet(b"")
@@ -1348,11 +1404,20 @@ class MySQLResult:
             # If an error occurs while sending the file, exit here without handling
             # the OK packet.
 
-        if not ok_packet.is_ok_packet():
+        if ok_packet.is_ok_packet():
+            self._read_ok_packet(ok_packet)
+            return
+        if ok_packet.is_load_local_packet():
+            # The server requested another file within the same execution.
+            # Upload sources are one-shot, so end this exchange with an
+            # empty response and report the protocol violation.
+            conn.write_packet(b"")
+            conn._read_packet()
             raise err.OperationalError(
-                CR.CR_COMMANDS_OUT_OF_SYNC, "Commands Out of Sync"
+                CR.CR_COMMANDS_OUT_OF_SYNC,
+                "Server requested an additional LOCAL INFILE upload",
             )
-        self._read_ok_packet(ok_packet)
+        raise err.OperationalError(CR.CR_COMMANDS_OUT_OF_SYNC, "Commands Out of Sync")
 
     def _check_packet_is_eof(self, packet):
         if not packet.is_eof_packet():
@@ -1506,3 +1571,51 @@ def _send_local_file(filename: str, conn: Connection):
             ER.FILE_NOT_FOUND,
             f"Can't open file '{filename}': {e}",
         )
+
+
+def _send_local_data(filename: bytes, conn: Connection):
+    """Send the data answering a LOCAL INFILE request to the server.
+
+    When a per-execution upload source was authorized for the current
+    query, only the bound opaque name is served and the filesystem is
+    never consulted.  Otherwise, fall back to the legacy behavior of
+    opening the file path requested by the server.
+    """
+    auth = conn._local_infile_auth
+    if auth is not None:
+        if auth.used or filename != auth.name:
+            raise err.OperationalError(
+                CR.CR_UNKNOWN_ERROR,
+                "LOAD DATA LOCAL INFILE request for "
+                f"{filename!r} does not match the authorized upload source",
+            )
+        auth.used = True
+        _send_local_stream(auth.source, conn)
+        return
+    if not conn._local_infile:
+        raise RuntimeError(
+            "**WARN**: Received LOAD_LOCAL packet but local_infile option is false."
+        )
+    _send_local_file(filename, conn)
+
+
+def _send_local_stream(source, conn: Connection):
+    """Send data packets from a binary stream or iterator to the server"""
+    packet_size = min(conn.max_allowed_packet, 16 * 1024)
+
+    read = getattr(source, "read", None)
+    if read is not None:
+        while True:
+            chunk = read(packet_size)
+            if not chunk:
+                break
+            conn.write_packet(chunk)
+        return
+
+    for chunk in source:
+        if not chunk:
+            continue
+        # Split oversized chunks so a single packet never exceeds
+        # max_allowed_packet.
+        for start in range(0, len(chunk), packet_size):
+            conn.write_packet(chunk[start : start + packet_size])

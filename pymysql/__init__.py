@@ -135,6 +135,7 @@ def thread_safe():
 
 Connect = connect = Connection = connections.Connection
 NULL = "NULL"
+LocalInfileSource = connections.LocalInfileSource
 
 
 __all__ = [
@@ -160,6 +161,7 @@ __all__ = [
     "InterfaceError",
     "InternalError",
     "MySQLError",
+    "LocalInfileSource",
     "NotSupportedError",
     "OperationalError",
     "ProgrammingError",

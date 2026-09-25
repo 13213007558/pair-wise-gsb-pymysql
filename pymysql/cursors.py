@@ -147,7 +147,7 @@ class Cursor:
 
         return self._mogrify(query, args)
 
-    def execute(self, query, args=None):
+    def execute(self, query, args=None, *, local_infile_source=None):
         """Execute a query.
 
         :param query: Query to execute.
@@ -155,6 +155,10 @@ class Cursor:
 
         :param args: Parameters used with query. (optional)
         :type args: tuple, list or dict
+
+        :param local_infile_source: A :class:`pymysql.LocalInfileSource`
+            authorizing a single ``LOAD DATA LOCAL INFILE`` upload for
+            this execution. (optional)
 
         :return: Number of affected rows.
         :rtype: int
@@ -167,7 +171,7 @@ class Cursor:
 
         if args is not None:
             query = self._mogrify(query, args)
-        result = self._query(query)
+        result = self._query(query, local_infile_source=local_infile_source)
         self._executed = query
         return result
 
@@ -329,10 +333,10 @@ class Cursor:
             raise IndexError("out of range")
         self.rownumber = r
 
-    def _query(self, q):
+    def _query(self, q, local_infile_source=None):
         conn = self._get_db()
         self._clear_result()
-        conn.query(q)
+        conn.query(q, local_infile_source=local_infile_source)
         self._do_get_result()
         return self.rowcount
 
@@ -430,10 +434,10 @@ class SSCursor(Cursor):
 
     __del__ = close
 
-    def _query(self, q):
+    def _query(self, q, local_infile_source=None):
         conn = self._get_db()
         self._clear_result()
-        conn.query(q, unbuffered=True)
+        conn.query(q, unbuffered=True, local_infile_source=local_infile_source)
         self._do_get_result()
         return self.rowcount
 
