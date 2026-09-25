@@ -235,6 +235,9 @@ class Connection:
         self._local_infile = bool(local_infile)
         if self._local_infile:
             client_flag |= CLIENT.LOCAL_FILES
+        # One-shot LOCAL INFILE source authorization registered via
+        # authorize_local_infile(). Valid for a single execution only.
+        self._local_infile_auth = None
 
         if read_default_group and not read_default_file:
             if sys.platform.startswith("win"):
@@ -577,9 +580,50 @@ class Connection:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
-        self._execute_command(COMMAND.COM_QUERY, sql)
-        self._affected_rows = self._read_query_result(unbuffered=unbuffered)
-        return self._affected_rows
+        try:
+            self._execute_command(COMMAND.COM_QUERY, sql)
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+            return self._affected_rows
+        finally:
+            # A LOCAL INFILE source authorization never outlives the
+            # execution it was registered for.
+            self._local_infile_auth = None
+
+    def authorize_local_infile(self, token, source):
+        """Authorize a one-shot in-memory source for LOAD DATA LOCAL INFILE.
+
+        Binds the opaque *token* to *source* for the next executed statement
+        only. If the server sends a LOCAL INFILE request during that
+        execution, data is taken from *source* only when the requested name
+        exactly matches *token*; any other request is refused without
+        touching the filesystem. The authorization is consumed by a single
+        matching request and is always discarded when the execution ends,
+        so it cannot leak into statements executed later on this connection
+        (for example when the connection is returned to a pool).
+
+        :param token: Opaque identifier (str or bytes) that the server-side
+            request must match, e.g. the file name used in the
+            LOAD DATA LOCAL INFILE '<token>' statement.
+        :param source: A binary file-like object (with a read() method) or
+            a one-shot iterable yielding bytes chunks.
+
+        Note that the server only sends LOCAL INFILE requests when the
+        local_infile connection option was enabled at connect time.
+        """
+        if isinstance(token, str):
+            token = token.encode(self.encoding)
+        elif isinstance(token, (bytearray, memoryview)):
+            token = bytes(token)
+        elif not isinstance(token, bytes):
+            raise TypeError(f"token must be str or bytes, got {type(token).__name__}")
+        if isinstance(source, (str, bytes, bytearray, os.PathLike)) or not (
+            hasattr(source, "read") or hasattr(source, "__iter__")
+        ):
+            raise TypeError(
+                "source must be a binary file-like object or an iterable "
+                f"of bytes, got {type(source).__name__}"
+            )
+        self._local_infile_auth = _LocalInfileAuthorization(token, source)
 
     def next_result(self, unbuffered=False):
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
@@ -883,6 +927,12 @@ class Connection:
             while self._result.has_next:
                 self.next_result()
             self._result = None
+
+        if command != COMMAND.COM_QUERY:
+            # LOCAL INFILE source authorizations only apply to the next
+            # COM_QUERY execution; discard a stale one so it cannot leak
+            # into a later statement (e.g. after the connection was pooled).
+            self._local_infile_auth = None
 
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
@@ -1334,20 +1384,19 @@ class MySQLResult:
 
     def _read_load_local_packet(self, first_packet):
         conn: Connection = self.connection
-        if not conn._local_infile:
-            raise RuntimeError(
-                "**WARN**: Received LOAD_LOCAL packet but local_infile option is false."
-            )
-        load_packet = LoadLocalPacketWrapper(first_packet)
-        try:
-            _send_local_file(load_packet.filename, conn)
-        finally:
-            # send the empty packet to signify we are done sending data
-            conn.write_packet(b"")
-            ok_packet = conn._read_packet()
-            # If an error occurs while sending the file, exit here without handling
-            # the OK packet.
+        packet = first_packet
+        while packet.is_load_local_packet():
+            load_packet = LoadLocalPacketWrapper(packet)
+            try:
+                _send_local_data(load_packet.filename, conn)
+            finally:
+                # send the empty packet to signify we are done sending data
+                conn.write_packet(b"")
+                packet = conn._read_packet()
+                # If an error occurs while sending the data, exit here without
+                # handling the response packet.
 
+        ok_packet = packet
         if not ok_packet.is_ok_packet():
             raise err.OperationalError(
                 CR.CR_COMMANDS_OUT_OF_SYNC, "Commands Out of Sync"
@@ -1506,3 +1555,71 @@ def _send_local_file(filename: str, conn: Connection):
             ER.FILE_NOT_FOUND,
             f"Can't open file '{filename}': {e}",
         )
+
+
+class _LocalInfileAuthorization:
+    """One-shot authorization binding an opaque token to an upload source."""
+
+    __slots__ = ("token", "source", "used")
+
+    def __init__(self, token: bytes, source):
+        self.token = token
+        self.source = source
+        self.used = False
+
+
+def _send_local_data(filename: bytes, conn: Connection):
+    """Send the data answering a LOCAL INFILE request to the server.
+
+    When a one-shot source was authorized for the current execution (see
+    Connection.authorize_local_infile), only that source may be sent and
+    the filesystem is never consulted. Otherwise the legacy behavior of
+    reading *filename* from disk applies (requires local_infile=True).
+    """
+    auth = conn._local_infile_auth
+    if auth is not None:
+        if filename != auth.token:
+            raise err.OperationalError(
+                CR.CR_UNKNOWN_ERROR,
+                f"Server requested LOCAL INFILE {filename!r} which does not "
+                "match the source authorized for this execution",
+            )
+        if auth.used:
+            raise err.OperationalError(
+                CR.CR_UNKNOWN_ERROR,
+                f"Authorized LOCAL INFILE source for {filename!r} was "
+                "already consumed",
+            )
+        auth.used = True
+        _send_local_stream(auth.source, conn)
+        return
+    if not conn._local_infile:
+        raise RuntimeError(
+            "**WARN**: Received LOAD_LOCAL packet but local_infile option is false."
+        )
+    _send_local_file(filename, conn)
+
+
+def _send_local_stream(source, conn: Connection):
+    """Send data packets from a file-like object or an iterable of bytes
+    chunks to the server, splitting the data at packet boundaries."""
+    packet_size = min(conn.max_allowed_packet, 16 * 1024)
+
+    read = getattr(source, "read", None)
+    if read is not None:
+        chunks = iter(lambda: read(packet_size), b"")
+    else:
+        chunks = iter(source)
+
+    pending = bytearray()
+    for chunk in chunks:
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "LOCAL INFILE source must produce bytes, " f"got {type(chunk).__name__}"
+            )
+        pending += chunk
+        while len(pending) >= packet_size:
+            conn.write_packet(bytes(pending[:packet_size]))
+            del pending[:packet_size]
+    if pending:
+        conn.write_packet(bytes(pending))
