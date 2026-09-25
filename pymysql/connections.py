@@ -927,6 +927,10 @@ class Connection:
         # also advertises SSL support.
         # _do_ssl is set here and checked below for sha256_password auth.
         client_flags = self.client_flag
+        # CLIENT.DEPRECATE_EOF is only honored when the server also
+        # advertises support for it.
+        if not self.server_capabilities & CLIENT.DEPRECATE_EOF:
+            client_flags &= ~CLIENT.DEPRECATE_EOF
         if self.ssl:
             if self.server_capabilities & CLIENT.SSL:
                 # SSL upgrade: include CLIENT.SSL flag and wrap the socket.
@@ -1357,14 +1361,24 @@ class MySQLResult:
     def _check_packet_is_eof(self, packet):
         if not packet.is_eof_packet():
             return False
-        # TODO: Support CLIENT.DEPRECATE_EOF
-        # 1) Add DEPRECATE_EOF to CAPABILITIES
-        # 2) Mask CAPABILITIES with server_capabilities
-        # 3) if server_capabilities & CLIENT.DEPRECATE_EOF:
-        #    use OKPacketWrapper instead of EOFPacketWrapper
-        wp = EOFPacketWrapper(packet)
-        self.warning_count = wp.warning_count
-        self.has_next = wp.has_next
+        conn = self.connection
+        if (
+            conn is not None
+            and conn.client_flag & CLIENT.DEPRECATE_EOF
+            and conn.server_capabilities & CLIENT.DEPRECATE_EOF
+        ):
+            # The server sent an OK packet (with a 0xFE header) instead of
+            # an EOF packet because CLIENT_DEPRECATE_EOF was negotiated.
+            # Don't overwrite affected_rows here: it is set by the caller
+            # from the number of rows read, while this packet reports 0.
+            wp = OKPacketWrapper(packet)
+            self.warning_count = wp.warning_count
+            self.server_status = wp.server_status
+            self.has_next = wp.has_next
+        else:
+            wp = EOFPacketWrapper(packet)
+            self.warning_count = wp.warning_count
+            self.has_next = wp.has_next
         return True
 
     def _read_result_packet(self, first_packet):
@@ -1484,8 +1498,13 @@ class MySQLResult:
                 print(f"DEBUG: field={field}, converter={converter}")
             self.converters.append((encoding, converter))
 
-        eof_packet = self.connection._read_packet()
-        assert eof_packet.is_eof_packet(), "Protocol error, expecting EOF"
+        # The packet terminating the field descriptors is an EOF packet,
+        # or an OK packet when CLIENT_DEPRECATE_EOF is negotiated.
+        if not self._check_packet_is_eof(self.connection._read_packet()):
+            raise err.OperationalError(
+                CR.CR_MALFORMED_PACKET,
+                "Protocol error, expecting EOF",
+            )
         self.description = tuple(description)
 
 
