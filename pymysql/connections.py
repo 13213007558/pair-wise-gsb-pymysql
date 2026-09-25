@@ -339,6 +339,11 @@ class Connection:
 
         self.cursorclass = cursorclass
 
+        # Whether CLIENT_DEPRECATE_EOF was negotiated with the server.
+        # When True, result sets are terminated by an OK packet (0xFE
+        # header) instead of an EOF packet.
+        self._deprecate_eof = False
+
         self._result = None
         self._affected_rows = 0
         self.host_info = "Not connected"
@@ -943,6 +948,11 @@ class Connection:
         else:
             _do_ssl = False
 
+        # Only use CLIENT_DEPRECATE_EOF when the server supports it.
+        self._deprecate_eof = bool(self.server_capabilities & CLIENT.DEPRECATE_EOF)
+        if not self._deprecate_eof:
+            client_flags &= ~CLIENT.DEPRECATE_EOF
+
         data_init = struct.pack(
             "<iIB23s", client_flags, MAX_PACKET_LEN, charset_id, b""
         )
@@ -1357,12 +1367,13 @@ class MySQLResult:
     def _check_packet_is_eof(self, packet):
         if not packet.is_eof_packet():
             return False
-        # TODO: Support CLIENT.DEPRECATE_EOF
-        # 1) Add DEPRECATE_EOF to CAPABILITIES
-        # 2) Mask CAPABILITIES with server_capabilities
-        # 3) if server_capabilities & CLIENT.DEPRECATE_EOF:
-        #    use OKPacketWrapper instead of EOFPacketWrapper
-        wp = EOFPacketWrapper(packet)
+        if self.connection._deprecate_eof:
+            # CLIENT_DEPRECATE_EOF was negotiated: the result set is
+            # terminated by an OK packet (0xFE header) instead of an
+            # EOF packet.
+            wp = OKPacketWrapper(packet)
+        else:
+            wp = EOFPacketWrapper(packet)
         self.warning_count = wp.warning_count
         self.has_next = wp.has_next
         return True

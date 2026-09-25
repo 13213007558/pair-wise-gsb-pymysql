@@ -284,7 +284,9 @@ class OKPacketWrapper:
     """
 
     def __init__(self, from_packet):
-        if not from_packet.is_ok_packet():
+        # When CLIENT_DEPRECATE_EOF is negotiated, an OK packet with a 0xFE
+        # header is sent in place of an EOF packet.
+        if not (from_packet.is_ok_packet() or from_packet.is_eof_packet()):
             raise ValueError(
                 "Cannot create "
                 + str(self.__class__.__name__)
