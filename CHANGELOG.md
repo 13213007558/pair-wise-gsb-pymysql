@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+Added support for the zlib compressed protocol. Pass `compress=True` to
+`pymysql.connect()` to negotiate CLIENT.COMPRESS and exchange compressed
+packets with the server.
+
 ## v1.2.3
 
 Release date: 2026-09-17

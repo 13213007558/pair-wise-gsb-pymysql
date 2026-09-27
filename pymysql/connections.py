@@ -12,6 +12,7 @@ import struct
 import sys
 import traceback
 import warnings
+import zlib
 
 from . import VERSION_STRING, _auth, converters, err
 from .charset import charset_by_id, charset_by_name
@@ -159,7 +160,7 @@ class Connection:
         (if no authenticate method) for returning a string from the user. (experimental)
     :param server_public_key: SHA256 authentication plugin public key value. (default: None)
     :param binary_prefix: **DEPRECATED**
-    :param compress: Not supported.
+    :param compress: Use zlib compression for the protocol traffic.
     :param named_pipe: Not supported.
     :param db: **DEPRECATED** Alias for database.
     :param passwd: **DEPRECATED** Alias for password.
@@ -213,7 +214,7 @@ class Connection:
         ssl_key_password=None,
         ssl_verify_cert=None,
         ssl_verify_identity=None,
-        compress=None,  # not supported
+        compress=None,
         named_pipe=None,  # not supported
         passwd=None,  # deprecated
         db=None,  # deprecated
@@ -227,14 +228,25 @@ class Connection:
             )
             password = passwd
 
-        if compress or named_pipe:
-            raise NotImplementedError(
-                "compress and named_pipe arguments are not supported"
-            )
+        if named_pipe:
+            raise NotImplementedError("named_pipe argument is not supported")
+
+        self._compress = bool(compress)
+        # Whether the compressed protocol is active. It is enabled after the
+        # handshake response packet when both sides support CLIENT.COMPRESS.
+        self._compressed = False
+        # Sequence id of the compressed protocol frames. It is independent
+        # of the inner MySQL packet sequence id, shared by both directions,
+        # and never reset while the connection lives.
+        self._compressed_seq_id = 0
+        # Buffer holding decompressed payload bytes not yet consumed.
+        self._compressed_buf = bytearray()
 
         self._local_infile = bool(local_infile)
         if self._local_infile:
             client_flag |= CLIENT.LOCAL_FILES
+        if self._compress:
+            client_flag |= CLIENT.COMPRESS
 
         if read_default_group and not read_default_file:
             if sys.platform.startswith("win"):
@@ -697,6 +709,12 @@ class Connection:
             self._current_timeout = self._read_timeout
             self._rfile = sock.makefile("rb")
             self._next_seq_id = 0
+            # The handshake itself is never compressed. Compression starts
+            # after the handshake response packet (see
+            # _request_authentication).
+            self._compressed = False
+            self._compressed_seq_id = 0
+            self._compressed_buf = bytearray()
 
             self._get_server_information()
             self._request_authentication()
@@ -813,6 +831,11 @@ class Connection:
     def _read_bytes(self, num_bytes):
         # NOTE: caller should call self._sock.settimeout(self._read_timeout)
         # before first read.
+        if self._compressed:
+            return self._read_compressed_bytes(num_bytes)
+        return self._read_bytes_raw(num_bytes)
+
+    def _read_bytes_raw(self, num_bytes):
         while True:
             try:
                 data = self._rfile.read(num_bytes)
@@ -836,10 +859,71 @@ class Connection:
             )
         return data
 
+    def _read_compressed_bytes(self, num_bytes):
+        """Read decompressed payload bytes, reading compressed protocol
+        frames from the network as needed.
+
+        Compressed frames and inner MySQL packets don't align: a frame may
+        hold several MySQL packets and a MySQL packet may span frames.
+        """
+        buf = self._compressed_buf
+        while len(buf) < num_bytes:
+            self._read_compressed_frame()
+        data = bytes(buf[:num_bytes])
+        del buf[:num_bytes]
+        return data
+
+    def _read_compressed_frame(self):
+        """Read one compressed protocol frame and append its payload to the
+        decompression buffer.
+
+        :raise OperationalError: If the payload can't be decompressed or its
+            length doesn't match the frame header. The frame boundaries are
+            lost in both cases, so the connection is closed.
+        :raise InternalError: If the compressed sequence id is wrong.
+        """
+        # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html
+        header = self._read_bytes_raw(7)
+        btrl, btrh, seq_id, ubtrl, ubtrh = struct.unpack("<HBBHB", header)
+        payload_len = btrl + (btrh << 16)
+        uncompressed_len = ubtrl + (ubtrh << 16)
+        if seq_id != self._compressed_seq_id:
+            self._force_close()
+            raise err.InternalError(
+                "Compressed packet sequence number wrong - got %d expected %d"
+                % (seq_id, self._compressed_seq_id)
+            )
+        self._compressed_seq_id = (self._compressed_seq_id + 1) % 256
+
+        payload = self._read_bytes_raw(payload_len)
+        if uncompressed_len == 0:
+            # Payload was stored uncompressed.
+            self._compressed_buf += payload
+            return
+
+        try:
+            data = zlib.decompress(payload)
+        except zlib.error:
+            self._force_close()
+            raise err.OperationalError(
+                CR.CR_MALFORMED_PACKET,
+                "Malformed compressed packet: can't decompress payload",
+            )
+        if len(data) != uncompressed_len:
+            self._force_close()
+            raise err.OperationalError(
+                CR.CR_MALFORMED_PACKET,
+                "Malformed compressed packet: expected %d decompressed bytes,"
+                " got %d" % (uncompressed_len, len(data)),
+            )
+        self._compressed_buf += data
+
     def _write_bytes(self, data):
         if self._current_timeout != self._write_timeout:
             self._sock.settimeout(self._write_timeout)
             self._current_timeout = self._write_timeout
+        if self._compressed:
+            data = self._compress_packets(data)
         try:
             self._sock.sendall(data)
         except OSError as e:
@@ -847,6 +931,32 @@ class Connection:
             raise err.OperationalError(
                 CR.CR_SERVER_GONE_ERROR, f"MySQL server has gone away ({e!r})"
             )
+
+    def _compress_packets(self, data):
+        """Wrap MySQL packet bytes into compressed protocol frames.
+
+        A frame payload is limited to MAX_PACKET_LEN bytes, so a large MySQL
+        packet may be split over several frames. Payloads that don't shrink
+        are sent uncompressed (uncompressed length of 0).
+        """
+        frames = []
+        while data:
+            chunk, data = data[:MAX_PACKET_LEN], data[MAX_PACKET_LEN:]
+            compressed = zlib.compress(chunk)
+            if len(compressed) < len(chunk):
+                payload = compressed
+                uncompressed_len = len(chunk)
+            else:
+                payload = chunk
+                uncompressed_len = 0
+            frames.append(
+                _pack_int24(len(payload))
+                + bytes([self._compressed_seq_id])
+                + _pack_int24(uncompressed_len)
+                + payload
+            )
+            self._compressed_seq_id = (self._compressed_seq_id + 1) % 256
+        return b"".join(frames)
 
     def _read_query_result(self, unbuffered=False):
         self._result = None
@@ -1007,6 +1117,14 @@ class Connection:
             data += _lenenc_int(len(connect_attrs)) + connect_attrs
 
         self.write_packet(data)
+
+        # The handshake response is the last uncompressed packet. When both
+        # sides support CLIENT.COMPRESS, everything after it (including the
+        # rest of the authentication exchange) uses compressed frames.
+        if self._compress and self.server_capabilities & CLIENT.COMPRESS:
+            self._compressed = True
+            self._compressed_seq_id = 0
+
         auth_packet = self._read_packet()
 
         # Authentication is a state machine. An authentication plugin can return
