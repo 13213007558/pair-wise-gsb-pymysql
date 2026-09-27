@@ -12,6 +12,7 @@ import struct
 import sys
 import traceback
 import warnings
+import zlib
 
 from . import VERSION_STRING, _auth, converters, err
 from .charset import charset_by_id, charset_by_name
@@ -159,7 +160,8 @@ class Connection:
         (if no authenticate method) for returning a string from the user. (experimental)
     :param server_public_key: SHA256 authentication plugin public key value. (default: None)
     :param binary_prefix: **DEPRECATED**
-    :param compress: Not supported.
+    :param compress: Use zlib compression for the connection. Requires the
+        server to support the compressed protocol. (default: False)
     :param named_pipe: Not supported.
     :param db: **DEPRECATED** Alias for database.
     :param passwd: **DEPRECATED** Alias for password.
@@ -173,6 +175,7 @@ class Connection:
     _auth_plugin_name = ""
     _closed = False
     _secure = False
+    _compressed = False
 
     def __init__(
         self,
@@ -213,7 +216,7 @@ class Connection:
         ssl_key_password=None,
         ssl_verify_cert=None,
         ssl_verify_identity=None,
-        compress=None,  # not supported
+        compress=None,
         named_pipe=None,  # not supported
         passwd=None,  # deprecated
         db=None,  # deprecated
@@ -227,10 +230,10 @@ class Connection:
             )
             password = passwd
 
-        if compress or named_pipe:
-            raise NotImplementedError(
-                "compress and named_pipe arguments are not supported"
-            )
+        if named_pipe:
+            raise NotImplementedError("named_pipe argument is not supported")
+
+        self.compress = bool(compress)
 
         self._local_infile = bool(local_infile)
         if self._local_infile:
@@ -697,6 +700,14 @@ class Connection:
             self._current_timeout = self._read_timeout
             self._rfile = sock.makefile("rb")
             self._next_seq_id = 0
+            # Compressed protocol state. Compression is negotiated during
+            # authentication and enabled once the handshake response packet
+            # has been sent. The compressed frames have their own sequence
+            # numbers, independent of the inner MySQL packet sequence ids.
+            self._compressed = False
+            self._compressed_read_seq_id = 0
+            self._compressed_write_seq_id = 0
+            self._compressed_buff = b""
 
             self._get_server_information()
             self._request_authentication()
@@ -813,6 +824,19 @@ class Connection:
     def _read_bytes(self, num_bytes):
         # NOTE: caller should call self._sock.settimeout(self._read_timeout)
         # before first read.
+        if self._compressed:
+            # MySQL packets and compressed frames don't share boundaries:
+            # one frame may carry several packets and one packet may span
+            # several frames. Serve reads from the decompressed buffer and
+            # pull in more frames as needed.
+            while len(self._compressed_buff) < num_bytes:
+                self._read_compressed_packet()
+            data = self._compressed_buff[:num_bytes]
+            self._compressed_buff = self._compressed_buff[num_bytes:]
+            return data
+        return self._read_raw_bytes(num_bytes)
+
+    def _read_raw_bytes(self, num_bytes):
         while True:
             try:
                 data = self._rfile.read(num_bytes)
@@ -836,7 +860,52 @@ class Connection:
             )
         return data
 
+    def _read_compressed_packet(self):
+        """Read one compressed protocol frame and append its decompressed
+        payload to the read buffer.
+
+        https://dev.mysql.com/doc/internals/en/compressed-packet-header.html
+        """
+        header = self._read_raw_bytes(7)
+        compressed_len = header[0] | (header[1] << 8) | (header[2] << 16)
+        seq_id = header[3]
+        uncompressed_len = header[4] | (header[5] << 8) | (header[6] << 16)
+        if seq_id != self._compressed_read_seq_id:
+            self._force_close()
+            raise err.InternalError(
+                "Compressed packet sequence number wrong - got %d expected %d"
+                % (seq_id, self._compressed_read_seq_id)
+            )
+        self._compressed_read_seq_id = (self._compressed_read_seq_id + 1) % 256
+
+        payload = self._read_raw_bytes(compressed_len)
+        if uncompressed_len == 0:
+            # Payload was stored uncompressed.
+            self._compressed_buff += payload
+            return
+
+        try:
+            data = zlib.decompress(payload)
+        except zlib.error as e:
+            # Packet boundaries are lost; the connection is unusable.
+            self._force_close()
+            raise err.OperationalError(
+                CR.CR_SERVER_LOST,
+                f"Lost connection to MySQL server during query (invalid compressed data: {e})",
+            )
+        if len(data) != uncompressed_len:
+            self._force_close()
+            raise err.OperationalError(
+                CR.CR_SERVER_LOST,
+                "Lost connection to MySQL server during query"
+                " (compressed packet length mismatch:"
+                f" got {len(data)}, expected {uncompressed_len})",
+            )
+        self._compressed_buff += data
+
     def _write_bytes(self, data):
+        if self._compressed:
+            data = self._compress_data(data)
         if self._current_timeout != self._write_timeout:
             self._sock.settimeout(self._write_timeout)
             self._current_timeout = self._write_timeout
@@ -847,6 +916,34 @@ class Connection:
             raise err.OperationalError(
                 CR.CR_SERVER_GONE_ERROR, f"MySQL server has gone away ({e!r})"
             )
+
+    def _compress_data(self, data):
+        """Wrap serialized MySQL packet(s) into compressed protocol frames.
+
+        Frame boundaries don't need to align with MySQL packet boundaries,
+        so the data is simply chopped into chunks small enough to fit into
+        one frame each.
+        """
+        out = bytearray()
+        pos = 0
+        while True:
+            chunk = data[pos : pos + MAX_PACKET_LEN]
+            pos += len(chunk)
+            compressed = zlib.compress(chunk)
+            if len(compressed) < len(chunk):
+                payload = compressed
+                uncompressed_len = len(chunk)
+            else:
+                # Incompressible (or empty) data is stored as is.
+                payload = chunk
+                uncompressed_len = 0
+            out += _pack_int24(len(payload))
+            out.append(self._compressed_write_seq_id)
+            out += _pack_int24(uncompressed_len)
+            out += payload
+            self._compressed_write_seq_id = (self._compressed_write_seq_id + 1) % 256
+            if pos >= len(data):
+                return bytes(out)
 
     def _read_query_result(self, unbuffered=False):
         self._result = None
@@ -927,6 +1024,13 @@ class Connection:
         # also advertises SSL support.
         # _do_ssl is set here and checked below for sha256_password auth.
         client_flags = self.client_flag
+        # CLIENT.COMPRESS is only announced when the server supports it.
+        # Compression itself starts after the handshake response packet
+        # (and the optional SSL upgrade) has been sent.
+        self._compress_after_handshake = False
+        if self.compress and self.server_capabilities & CLIENT.COMPRESS:
+            client_flags |= CLIENT.COMPRESS
+            self._compress_after_handshake = True
         if self.ssl:
             if self.server_capabilities & CLIENT.SSL:
                 # SSL upgrade: include CLIENT.SSL flag and wrap the socket.
@@ -1007,6 +1111,10 @@ class Connection:
             data += _lenenc_int(len(connect_attrs)) + connect_attrs
 
         self.write_packet(data)
+        if self._compress_after_handshake:
+            # Everything after the handshake response packet uses the
+            # compressed protocol, starting with the server's auth reply.
+            self._compressed = True
         auth_packet = self._read_packet()
 
         # Authentication is a state machine. An authentication plugin can return

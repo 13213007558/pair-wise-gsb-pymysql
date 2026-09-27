@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+Added support for the zlib compressed protocol via the ``compress`` argument.
+When both the client and the server enable ``CLIENT.COMPRESS``, all packets
+after the handshake response are exchanged inside compressed frames.
+
 ## v1.2.3
 
 Release date: 2026-09-17
