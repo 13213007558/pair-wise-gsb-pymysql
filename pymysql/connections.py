@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import errno
 import os
 import socket
@@ -65,6 +66,28 @@ TEXT_TYPES = {
 DEFAULT_CHARSET = "utf8mb4"
 
 MAX_PACKET_LEN = 2**24 - 1
+
+
+class ConnectionState(enum.Enum):
+    """Lifecycle states of a :class:`Connection`.
+
+    A connection is usable for queries only in :attr:`CONNECTED`. In every
+    other state the handshake or initialization has not completed, so the
+    object must never be mistaken for an available connection.
+    """
+
+    #: ``connect()`` was never called or the object was closed cleanly.
+    DISCONNECTED = "disconnected"
+    #: The TCP/UNIX socket is being established or the server handshake read.
+    CONNECTING = "connecting"
+    #: TLS upgrade, authentication and post-auth initialization are in flight.
+    AUTHENTICATING = "authenticating"
+    #: The full handshake, including every initialization query, completed.
+    CONNECTED = "connected"
+    #: A connection or initialization attempt failed; resources were released.
+    FAILED = "failed"
+    #: ``close()`` was called on a previously established connection.
+    CLOSED = "closed"
 
 
 def _pack_int24(n):
@@ -173,6 +196,22 @@ class Connection:
     _auth_plugin_name = ""
     _closed = False
     _secure = False
+
+    #: Current lifecycle state. Only ``ConnectionState.CONNECTED`` is usable.
+    _state = ConnectionState.DISCONNECTED
+
+    # Identity/session attributes negotiated during a handshake. They are
+    # reset to these defaults before every (re)connect so that state left over
+    # from a previous or failed connection can never be mistaken for the
+    # identity of the new connection.
+    salt = b""
+    server_capabilities = 0
+    server_thread_id = (0,)
+    server_version = None
+    server_status = 0
+    protocol_version = None
+    server_language = None
+    server_charset = None
 
     def __init__(
         self,
@@ -436,6 +475,16 @@ class Connection:
         if self._closed:
             raise err.Error("Already closed")
         self._closed = True
+        if self._state is ConnectionState.CONNECTED:
+            self._state = ConnectionState.CLOSED
+        elif self._state is ConnectionState.FAILED:
+            # A failed connection has already released every resource; keep
+            # the failure observable rather than rewriting the history.
+            pass
+        else:
+            # Never reached CONNECTED (deferred or still connecting): there is
+            # nothing clean to quit, so mark the object as not usable.
+            self._state = ConnectionState.DISCONNECTED
         if self._sock is None:
             return
         send_data = struct.pack("<iB", 1, COMMAND.COM_QUIT)
@@ -447,11 +496,11 @@ class Connection:
 
     @property
     def open(self):
-        """Return True if the connection is open."""
-        return self._sock is not None
+        """Return True only when the full connection handshake completed."""
+        return self._state is ConnectionState.CONNECTED
 
     def _force_close(self):
-        """Close connection without QUIT message."""
+        """Close connection without QUIT message and release every resource."""
         if self._rfile:
             self._rfile.close()
         if self._sock:
@@ -461,6 +510,23 @@ class Connection:
                 pass
         self._sock = None
         self._rfile = None
+        self._secure = False
+        if self._state is ConnectionState.CLOSED:
+            return
+        if self._state is not ConnectionState.CONNECTED:
+            # The handshake never completed, so any negotiated attribute is
+            # only partial. Drop it so a failed object cannot be inspected as
+            # if it held a verified identity, and a reconnect starts clean.
+            self._auth_plugin_name = ""
+            self.salt = b""
+            self.server_capabilities = 0
+            self.server_thread_id = (0,)
+            self.server_version = None
+            self.server_status = 0
+            self.protocol_version = None
+            self.server_language = None
+            self.server_charset = None
+        self._state = ConnectionState.FAILED
 
     __del__ = _force_close
 
@@ -621,7 +687,7 @@ class Connection:
                 DeprecationWarning,
                 2,
             )
-        if self._sock is None:
+        if self._state is not ConnectionState.CONNECTED:
             if reconnect:
                 self.connect()
                 reconnect = False
@@ -670,8 +736,42 @@ class Connection:
         self.encoding = encoding
         self.collation = collation
 
-    def connect(self, sock=None):
+    def _reset_session_state(self):
+        """Discard every identity/session attribute from a previous handshake.
+
+        Called at the start of each (re)connect so that partially negotiated or
+        stale state can never be observed as the identity of the new connection.
+        """
         self._closed = False
+        self._secure = False
+        self._auth_plugin_name = ""
+        self.salt = b""
+        self.server_capabilities = 0
+        self.server_thread_id = (0,)
+        self.server_version = None
+        self.server_status = 0
+        self.protocol_version = None
+        self.server_language = None
+        self.server_charset = None
+        self._next_seq_id = 0
+        self._result = None
+        self._affected_rows = 0
+        self.host_info = "Not connected"
+
+    def connect(self, sock=None):
+        # A connection that is mid-handshake must not be re-entered: doing so
+        # would orphan the in-flight socket and mix two handshakes together.
+        if self._state in (
+            ConnectionState.CONNECTING,
+            ConnectionState.AUTHENTICATING,
+        ):
+            raise err.Error("Connection is already being established")
+
+        # Rebuild the whole identity from scratch. Reusing attributes from a
+        # previous (possibly failed) connection would let a half-authenticated
+        # object inherit credentials state it never negotiated.
+        self._reset_session_state()
+        self._state = ConnectionState.CONNECTING
         try:
             if sock is None:
                 if self.unix_socket:
@@ -709,6 +809,10 @@ class Connection:
             self._next_seq_id = 0
 
             self._get_server_information()
+
+            # The socket and server handshake exist, but the peer's identity
+            # is not established until TLS and authentication finish.
+            self._state = ConnectionState.AUTHENTICATING
             self._request_authentication()
 
             # Send "SET NAMES" query on init for:
@@ -738,6 +842,11 @@ class Connection:
 
             if self.autocommit_mode is not None:
                 self.autocommit(self.autocommit_mode)
+
+            # Only mark the connection available once every initialization
+            # step has succeeded. A failure above keeps it AUTHENTICATING until
+            # the handler below releases the resources and marks it FAILED.
+            self._state = ConnectionState.CONNECTED
         except BaseException as e:
             self._force_close()
 
@@ -881,7 +990,7 @@ class Connection:
         :raise InterfaceError: If the connection is closed.
         :raise ValueError: If no username was specified.
         """
-        if not self._sock:
+        if self._state is not ConnectionState.CONNECTED:
             raise err.InterfaceError(0, "")
 
         # If the last query was unbuffered, make sure it finishes before
@@ -959,8 +1068,23 @@ class Connection:
 
         if _do_ssl:
             self.write_packet(data_init)
-            self._sock = self.ctx.wrap_socket(self._sock, server_hostname=self.host)
-            self._rfile = self._sock.makefile("rb")
+            # The buffered reader wraps the plain socket; release it before the
+            # socket is replaced by its TLS wrapper, otherwise its file
+            # descriptor leaks. On failure leave the raw socket in place so the
+            # connect() exception handler can close it.
+            raw_sock = self._sock
+            raw_rfile = self._rfile
+            self._sock = None
+            self._rfile = None
+            try:
+                tls_sock = self.ctx.wrap_socket(raw_sock, server_hostname=self.host)
+            except BaseException:
+                self._sock = raw_sock
+                self._rfile = raw_rfile
+                raise
+            raw_rfile.close()
+            self._sock = tls_sock
+            self._rfile = tls_sock.makefile("rb")
             self._secure = True
 
         data = data_init + self.user + b"\0"
