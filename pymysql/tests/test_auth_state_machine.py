@@ -170,6 +170,71 @@ class TestAuthenticationStateMachine:
         ):
             conn._request_authentication()
 
+    def test_custom_handler_returning_none_without_ok_is_rejected(self):
+        class EarlyNoneHandler:
+            def __init__(self, conn):
+                pass
+
+            def authenticate(self, packet):
+                return None
+
+        conn = self.connection(auth_plugin_map={b"custom": EarlyNoneHandler})
+        packets = [self.packet(b"\xfecustom\0challenge"), self.packet(self.ok_packet)]
+
+        with (
+            mock.patch.object(conn, "write_packet"),
+            mock.patch.object(conn, "_read_packet", side_effect=packets),
+            pytest.raises(
+                pymysql.err.OperationalError,
+                match="returned None without reading the final OK packet",
+            ),
+        ):
+            conn._request_authentication()
+
+    def test_custom_handler_returning_input_packet_is_rejected(self):
+        class EchoHandler:
+            def __init__(self, conn):
+                pass
+
+            def authenticate(self, packet):
+                return packet
+
+        conn = self.connection(auth_plugin_map={b"custom": EchoHandler})
+        packets = [self.packet(b"\xfecustom\0challenge"), self.packet(self.ok_packet)]
+
+        with (
+            mock.patch.object(conn, "write_packet"),
+            mock.patch.object(conn, "_read_packet", side_effect=packets),
+            pytest.raises(
+                pymysql.err.OperationalError,
+                match="returned the packet it was given",
+            ),
+        ):
+            conn._request_authentication()
+
+    def test_custom_handler_returning_ok_without_reading_is_rejected(self):
+        ok_packet = self.packet(self.ok_packet)
+
+        class SyntheticOKHandler:
+            def __init__(self, conn):
+                pass
+
+            def authenticate(self, packet):
+                return ok_packet
+
+        conn = self.connection(auth_plugin_map={b"custom": SyntheticOKHandler})
+        packets = [self.packet(b"\xfecustom\0challenge"), self.packet(self.ok_packet)]
+
+        with (
+            mock.patch.object(conn, "write_packet"),
+            mock.patch.object(conn, "_read_packet", side_effect=packets),
+            pytest.raises(
+                pymysql.err.OperationalError,
+                match="not the most recent packet",
+            ),
+        ):
+            conn._request_authentication()
+
     def test_non_ok_terminal_packet_is_rejected(self):
         conn = self.connection()
 

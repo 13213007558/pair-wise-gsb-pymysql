@@ -155,8 +155,11 @@ class Connection:
     :param auth_plugin_map: A dict of plugin names to a class that processes that plugin.
         The class will take the Connection object as the argument to the constructor.
         The class needs an authenticate method taking an authentication packet as
-        an argument.  For the dialog plugin, a prompt(echo, prompt) method can be used
-        (if no authenticate method) for returning a string from the user. (experimental)
+        an argument.  The authenticate method must return the last packet it read
+        from the server.  It may return ``None`` only after it has read the server's
+        terminal OK packet.  For the dialog plugin, a prompt(echo, prompt) method
+        can be used (if no authenticate method) for returning a string from the
+        user. (experimental)
     :param server_public_key: SHA256 authentication plugin public key value. (default: None)
     :param binary_prefix: **DEPRECATED**
     :param compress: Not supported.
@@ -1017,8 +1020,30 @@ class Connection:
             data += _lenenc_int(len(connect_attrs)) + connect_attrs
 
         self.write_packet(data)
-        auth_packet = self._read_packet()
 
+        # Keep packet reads observable during authentication: plugins frequently
+        # call back into conn._read_packet(), and the driver must know which
+        # packet the plugin actually consumed from the server.
+        auth_packet = self._read_packet()
+        read_packets = [auth_packet]
+        original_read_packet = self._read_packet
+
+        def tracked_read_packet(*args, **kwargs):
+            packet = original_read_packet(*args, **kwargs)
+            read_packets.append(packet)
+            return packet
+
+        overridden_in_instance = "_read_packet" in self.__dict__
+        self._read_packet = tracked_read_packet
+        try:
+            self._request_authentication_loop(auth_packet, read_packets)
+        finally:
+            if overridden_in_instance:
+                self._read_packet = original_read_packet
+            else:
+                del self._read_packet
+
+    def _request_authentication_loop(self, auth_packet, read_packets):
         # Authentication is a state machine. An authentication plugin can return
         # another transition packet (for example, MySQL Router can request full
         # caching_sha2_password authentication and then switch to the backend's
@@ -1029,12 +1054,26 @@ class Connection:
             auth_plugin_name = auth_plugin_name.encode("ascii")
         auth_plugin_handler = self._get_auth_plugin_handler(auth_plugin_name)
         auth_switch_received = False
+        auth_ok_seen = False
+
+        def last_read():
+            return read_packets[-1] if read_packets else None
 
         while True:
-            # Custom authentication handlers historically did not need to return
-            # the final OK packet after consuming the complete exchange.
-            if auth_packet is None and auth_plugin_handler:
-                break
+            if auth_packet is None:
+                # A custom handler may return None only after it has consumed
+                # the server's terminal OK packet. Otherwise "no exception" is
+                # not evidence that authentication completed.
+                if auth_plugin_handler is not None and (
+                    last_read() is not None and last_read().is_ok_packet()
+                ):
+                    auth_ok_seen = True
+                    break
+                raise err.OperationalError(
+                    CR.CR_AUTH_PLUGIN_ERR,
+                    f"Authentication plugin {auth_plugin_name!r} returned None "
+                    "without reading the final OK packet",
+                )
 
             # if authentication method isn't accepted the first byte
             # will have the octet 254
@@ -1053,9 +1092,18 @@ class Connection:
                 ):
                     auth_plugin_name = plugin_name
                     auth_plugin_handler = self._get_auth_plugin_handler(plugin_name)
+                    handler_input = auth_packet
                     auth_packet = self._process_auth(
                         plugin_name, auth_packet, auth_plugin_handler
                     )
+                    if auth_packet is None:
+                        continue
+                    if auth_plugin_handler is not None:
+                        self._check_handler_returned_packet(
+                            auth_packet, handler_input, read_packets, auth_plugin_name
+                        )
+                        if auth_packet.is_ok_packet():
+                            auth_ok_seen = True
                     continue
                 raise err.OperationalError("received unknown auth switch request")
 
@@ -1064,7 +1112,14 @@ class Connection:
                     print("received extra data")
                 # https://dev.mysql.com/doc/internals/en/successful-authentication.html
                 if auth_plugin_handler:
+                    handler_input = auth_packet
                     auth_packet = auth_plugin_handler.authenticate(auth_packet)
+                    if auth_packet is not None:
+                        self._check_handler_returned_packet(
+                            auth_packet, handler_input, read_packets, auth_plugin_name
+                        )
+                        if auth_packet.is_ok_packet():
+                            auth_ok_seen = True
                     continue
                 elif auth_plugin_name in (
                     b"caching_sha2_password",
@@ -1080,11 +1135,51 @@ class Connection:
                 )
 
             if auth_packet.is_ok_packet():
+                auth_ok_seen = True
                 break
             raise err.OperationalError("unexpected packet during authentication")
 
+        # Authentication is not complete unless the driver, not the plugin,
+        # observed a terminal OK packet on the wire.  Custom handlers returning
+        # None after reading OK are supported; synthesizing an OK without
+        # reading it is not.
+        if auth_plugin_handler is not None and not auth_ok_seen:
+            raise err.OperationalError(
+                CR.CR_AUTH_PLUGIN_ERR,
+                f"Authentication plugin {auth_plugin_name!r} returned a packet "
+                "that was not the final OK packet",
+            )
+
         if DEBUG:
             print("Succeed to auth")
+
+    @staticmethod
+    def _check_handler_returned_packet(
+        auth_packet, handler_input, read_packets, plugin_name
+    ):
+        """Reject a handler return value that cannot be dispatched safely."""
+        if auth_packet is handler_input:
+            raise err.OperationalError(
+                CR.CR_AUTH_PLUGIN_ERR,
+                f"Authentication plugin {plugin_name!r} returned the packet "
+                "it was given instead of a packet read from the server",
+            )
+        if auth_packet is not read_packets[-1]:
+            raise err.OperationalError(
+                CR.CR_AUTH_PLUGIN_ERR,
+                f"Authentication plugin {plugin_name!r} returned a packet "
+                "that was not the most recent packet read from the server",
+            )
+        if not (
+            auth_packet.is_auth_switch_request()
+            or auth_packet.is_extra_auth_data()
+            or auth_packet.is_ok_packet()
+        ):
+            raise err.OperationalError(
+                CR.CR_AUTH_PLUGIN_ERR,
+                f"Authentication plugin {plugin_name!r} returned invalid "
+                "packet while authentication is in progress",
+            )
 
     def _process_auth(self, plugin_name, auth_packet, handler=None):
         if handler:
