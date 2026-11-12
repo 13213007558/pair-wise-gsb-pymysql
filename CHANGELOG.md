@@ -1,5 +1,23 @@
 # Changes
 
+## Unreleased
+
+* Add `Connection.get_security_info()`, a credential-free snapshot of the
+  negotiated connection security (transport, actual encryption, server
+  identity verification, final auth plugin after any plugin switch, TLS
+  version and cipher suite) that connection pools can inspect. It reflects
+  what was actually negotiated during the handshake, not the constructor
+  arguments, and returns None if no handshake completed.
+* Add the `strict_security` connection option. When enabled, the connection
+  is aborted after the handshake unless it uses a unix socket or TLS with a
+  verified server identity (`ssl_ca` with `ssl_verify_identity=True`), so no
+  queries can be sent on a connection that does not meet the policy. The
+  default (`False`) keeps the previous compatible behavior: the security
+  state is only reported, never enforced.
+* A failed handshake or reconnect no longer leaves the previous session's
+  security result behind.
+
+
 ## v1.2.4 (security fix)
 
 Release date: 2026-11-09

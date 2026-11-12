@@ -12,6 +12,7 @@ import struct
 import sys
 import traceback
 import warnings
+from typing import NamedTuple
 
 from . import VERSION_STRING, _auth, converters, err
 from .charset import charset_by_id, charset_by_name
@@ -65,6 +66,35 @@ TEXT_TYPES = {
 DEFAULT_CHARSET = "utf8mb4"
 
 MAX_PACKET_LEN = 2**24 - 1
+
+
+class SecurityInfo(NamedTuple):
+    """Credential-free snapshot of a connection's negotiated security state.
+
+    This describes what was actually negotiated during the handshake, not
+    what was requested via constructor arguments. It never contains
+    credentials (no user, password, or key material), so it is safe to
+    expose to connection pools and callers such as a Python backend that
+    needs to verify connection security.
+
+    :ivar transport: ``"unix"``, ``"tcp+tls"``, or ``"tcp"``.
+    :ivar encrypted: True if the transport is actually encrypted (TLS active).
+    :ivar server_identity_verified: True if the server's identity was
+        verified during the TLS handshake (CA-verified certificate plus
+        hostname check). Always False without TLS; unix sockets rely on
+        local filesystem trust instead.
+    :ivar auth_plugin: The authentication plugin ultimately used, after any
+        server-requested plugin switch (e.g. ``"mysql_native_password"``).
+    :ivar tls_version: Negotiated TLS protocol version, or None without TLS.
+    :ivar cipher_suite: Negotiated TLS cipher suite name, or None without TLS.
+    """
+
+    transport: str
+    encrypted: bool
+    server_identity_verified: bool
+    auth_plugin: str
+    tls_version: str | None
+    cipher_suite: str | None
 
 
 def _pack_int24(n):
@@ -145,6 +175,13 @@ class Connection:
     :param ssl_key_password: The password for the client certificate private key.
     :param ssl_verify_cert: Set to true to check the server certificate's validity.
     :param ssl_verify_identity: Set to true to check the server's identity.
+    :param strict_security: Enforce a strict security policy once the handshake
+        completes: the connection is aborted unless it uses a unix socket or
+        TLS with a verified server identity (``ssl_ca`` together with
+        ``ssl_verify_identity=True``). When the policy is not satisfied the
+        connection is closed and no queries can be sent on it.
+        (default: False - compatible mode, the negotiated security state is
+        only reported via get_security_info() and never enforced)
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
     :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
@@ -173,6 +210,12 @@ class Connection:
     _auth_plugin_name = ""
     _closed = False
     _secure = False
+    _security_info = None
+    _tls_active = False
+    _tls_version = None
+    _tls_cipher_suite = None
+    _server_identity_verified = False
+    _final_auth_plugin = ""
 
     def __init__(
         self,
@@ -213,6 +256,7 @@ class Connection:
         ssl_key_password=None,
         ssl_verify_cert=None,
         ssl_verify_identity=None,
+        strict_security=False,
         compress=None,  # not supported
         named_pipe=None,  # not supported
         passwd=None,  # deprecated
@@ -308,6 +352,8 @@ class Connection:
                 self.ssl = True
                 self._ssl_required = False
                 self.ctx = self._create_ssl_ctx({})
+
+        self._strict_security = bool(strict_security)
 
         self.host = host or "localhost"
         self.port = port or 3306
@@ -450,6 +496,41 @@ class Connection:
         """Return True if the connection is open."""
         return self._sock is not None
 
+    def get_security_info(self):
+        """Return a credential-free snapshot of the negotiated connection security.
+
+        The result reflects what was actually negotiated during the handshake
+        (transport encryption, server identity verification, and the final
+        authentication plugin after any plugin switch) - not the constructor
+        arguments that were requested. It contains no credentials, so
+        connection pools and callers can safely inspect it.
+
+        :return: A SecurityInfo named tuple, or None if no handshake has
+            completed on the current session (not connected, or the last
+            connect attempt failed).
+        """
+        return self._security_info
+
+    def _enforce_security_policy(self):
+        """Abort the connection if the negotiated security state does not meet
+        the strict policy (unix socket, or TLS with verified server identity)."""
+        info = self._security_info
+        if info is not None and info.transport == "unix":
+            # Local unix socket: no network exposure, nothing to verify.
+            return
+        if info is None or not info.encrypted:
+            raise err.OperationalError(
+                CR.CR_SSL_CONNECTION_ERROR,
+                "strict_security: connection is not encrypted; configure TLS "
+                "(ssl_ca and ssl_verify_identity) or use a unix socket",
+            )
+        if not info.server_identity_verified:
+            raise err.OperationalError(
+                CR.CR_SSL_CONNECTION_ERROR,
+                "strict_security: server identity was not verified; configure "
+                "ssl_ca with ssl_verify_identity=True",
+            )
+
     def _force_close(self):
         """Close connection without QUIT message."""
         if self._rfile:
@@ -461,6 +542,7 @@ class Connection:
                 pass
         self._sock = None
         self._rfile = None
+        self._security_info = None
 
     __del__ = _force_close
 
@@ -672,6 +754,15 @@ class Connection:
 
     def connect(self, sock=None):
         self._closed = False
+        # Reset the negotiated security state so a failed handshake cannot
+        # leave stale results from a previous session behind.
+        self._secure = False
+        self._tls_active = False
+        self._tls_version = None
+        self._tls_cipher_suite = None
+        self._server_identity_verified = False
+        self._final_auth_plugin = ""
+        self._security_info = None
         try:
             if sock is None:
                 if self.unix_socket:
@@ -710,6 +801,9 @@ class Connection:
 
             self._get_server_information()
             self._request_authentication()
+
+            if self._strict_security:
+                self._enforce_security_policy()
 
             # Send "SET NAMES" query on init for:
             # - Ensure charset (and collation) is set to the server.
@@ -962,6 +1056,14 @@ class Connection:
             self._sock = self.ctx.wrap_socket(self._sock, server_hostname=self.host)
             self._rfile = self._sock.makefile("rb")
             self._secure = True
+            self._tls_active = True
+            self._tls_version = self._sock.version()
+            cipher = self._sock.cipher()
+            self._tls_cipher_suite = cipher[0] if cipher else None
+            self._server_identity_verified = (
+                bool(getattr(self.ctx, "check_hostname", False))
+                and getattr(self.ctx, "verify_mode", None) == ssl.CERT_REQUIRED
+            )
 
         data = data_init + self.user + b"\0"
 
@@ -1085,6 +1187,27 @@ class Connection:
 
         if DEBUG:
             print("Succeed to auth")
+
+        # Record what was actually negotiated (after any auth plugin switch)
+        # as the credential-free security result for this session.
+        final_auth_plugin = auth_plugin_name
+        if isinstance(final_auth_plugin, bytes):
+            final_auth_plugin = final_auth_plugin.decode("ascii", "replace")
+        self._final_auth_plugin = final_auth_plugin or "mysql_native_password"
+        if self.unix_socket:
+            transport = "unix"
+        elif self._tls_active:
+            transport = "tcp+tls"
+        else:
+            transport = "tcp"
+        self._security_info = SecurityInfo(
+            transport=transport,
+            encrypted=self._tls_active,
+            server_identity_verified=self._server_identity_verified,
+            auth_plugin=self._final_auth_plugin,
+            tls_version=self._tls_version,
+            cipher_suite=self._tls_cipher_suite,
+        )
 
     def _process_auth(self, plugin_name, auth_packet, handler=None):
         if handler:
