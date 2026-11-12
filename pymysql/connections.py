@@ -158,6 +158,14 @@ class Connection:
         an argument.  For the dialog plugin, a prompt(echo, prompt) method can be used
         (if no authenticate method) for returning a string from the user. (experimental)
     :param server_public_key: SHA256 authentication plugin public key value. (default: None)
+    :param server_public_key_policy: Source policy for the server public key used
+        by the sha256_password and caching_sha2_password auth plugins.
+        ``"dynamic"`` (default, backwards compatible) allows requesting and
+        accepting the key from the server during authentication when no key is
+        configured. ``"pinned"`` only uses the pre-approved key given via
+        ``server_public_key``; keys sent by the server are rejected and
+        authentication fails before any encrypted credential is sent when no
+        key is configured. (default: "dynamic")
     :param binary_prefix: **DEPRECATED**
     :param compress: Not supported.
     :param named_pipe: Not supported.
@@ -205,6 +213,7 @@ class Connection:
         binary_prefix=False,
         program_name=None,
         server_public_key=None,
+        server_public_key_policy=None,
         ssl=None,
         ssl_ca=None,
         ssl_cert=None,
@@ -362,6 +371,14 @@ class Connection:
         self.max_allowed_packet = max_allowed_packet
         self._auth_plugin_map = auth_plugin_map or {}
         self.server_public_key = server_public_key
+        if server_public_key_policy is None:
+            server_public_key_policy = _auth.PUBLIC_KEY_POLICY_DYNAMIC
+        if server_public_key_policy not in _auth.PUBLIC_KEY_POLICIES:
+            raise ValueError(
+                "server_public_key_policy must be one of"
+                f" {_auth.PUBLIC_KEY_POLICIES!r}, got {server_public_key_policy!r}"
+            )
+        self.server_public_key_policy = server_public_key_policy
 
         self._connect_attrs = {
             "_client_name": "pymysql",
@@ -988,7 +1005,21 @@ class Connection:
             if _do_ssl:
                 authresp = self.password + b"\0"
             elif self.password:
-                authresp = b"\1"  # request public key
+                if self.server_public_key_policy == _auth.PUBLIC_KEY_POLICY_PINNED:
+                    # Pinned policy: never request the key from the server.
+                    # Fail before any credential leaves the client when no
+                    # pre-approved key is configured.
+                    if not self.server_public_key:
+                        raise err.OperationalError(
+                            CR.CR_AUTH_PLUGIN_ERR,
+                            "sha256_password: server public key is not configured"
+                            " (server_public_key_policy='pinned')",
+                        )
+                    authresp = _auth.sha2_rsa_encrypt(
+                        self.password, self.salt, self.server_public_key
+                    )
+                else:
+                    authresp = b"\1"  # request public key
             else:
                 authresp = b"\0"  # empty password
 

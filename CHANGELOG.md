@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+* Add the `server_public_key_policy` connection option for the
+  `sha256_password` and `caching_sha2_password` auth plugins. The default
+  `"dynamic"` policy keeps the backwards-compatible behavior of requesting
+  and accepting the server public key during authentication. The new
+  `"pinned"` policy only uses the pre-approved key configured via
+  `server_public_key`: keys sent by the server are rejected, and
+  authentication fails before any encrypted credential is sent when no key
+  is configured.
+
 ## v1.2.4 (security fix)
 
 Release date: 2026-11-09

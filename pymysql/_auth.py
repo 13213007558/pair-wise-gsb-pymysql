@@ -2,6 +2,7 @@
 Implements auth methods
 """
 
+from .constants import CR
 from .err import OperationalError
 
 try:
@@ -113,6 +114,24 @@ def ed25519_password(password, scramble):
 
 # sha256_password
 
+# Server public key source policies for sha256_password/caching_sha2_password.
+# "dynamic" (default, backwards compatible): the server public key may be
+# requested from and accepted from the server during authentication.
+# "pinned": only the pre-approved key configured via the `server_public_key`
+# connection option is used; keys sent by the server are never accepted.
+PUBLIC_KEY_POLICY_DYNAMIC = "dynamic"
+PUBLIC_KEY_POLICY_PINNED = "pinned"
+PUBLIC_KEY_POLICIES = (PUBLIC_KEY_POLICY_DYNAMIC, PUBLIC_KEY_POLICY_PINNED)
+
+
+def _pinned_policy_error(plugin_name, reason):
+    # Error messages deliberately state only the safe reason category; they
+    # must never include key material, packet payloads, or credentials.
+    return OperationalError(
+        CR.CR_AUTH_PLUGIN_ERR,
+        f"{plugin_name}: {reason} (server_public_key_policy='pinned')",
+    )
+
 
 def _roundtrip(conn, send_data):
     conn.write_packet(send_data)
@@ -167,12 +186,22 @@ def sha256_password_auth(conn, pkt):
         if conn.salt.endswith(b"\0"):
             conn.salt = conn.salt[:-1]
         if not conn.server_public_key and conn.password:
+            if conn.server_public_key_policy == PUBLIC_KEY_POLICY_PINNED:
+                # Reject before any key request or credential is emitted.
+                raise _pinned_policy_error(
+                    "sha256_password", "server public key is not configured"
+                )
             # Request server public key
             if DEBUG:
                 print("sha256: Requesting server public key")
             pkt = _roundtrip(conn, b"\1")
 
     if pkt.is_extra_auth_data():
+        if conn.server_public_key_policy == PUBLIC_KEY_POLICY_PINNED:
+            # Never let a server-supplied key replace the pre-approved one.
+            raise _pinned_policy_error(
+                "sha256_password", "refusing public key sent by server"
+            )
         conn.server_public_key = pkt._data[1:]
         if DEBUG:
             print("Received public key:\n", conn.server_public_key.decode("ascii"))
@@ -256,6 +285,11 @@ def caching_sha2_password_auth(conn, pkt):
         return _roundtrip(conn, conn.password + b"\0")
 
     if not conn.server_public_key:
+        if conn.server_public_key_policy == PUBLIC_KEY_POLICY_PINNED:
+            # Reject before any key request or credential is emitted.
+            raise _pinned_policy_error(
+                "caching_sha2_password", "server public key is not configured"
+            )
         pkt = _roundtrip(conn, b"\x02")  # Request public key
         if not pkt.is_extra_auth_data():
             raise OperationalError(
