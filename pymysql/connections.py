@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import io
 import os
 import socket
 import struct
@@ -21,7 +22,6 @@ from .optionfile import Parser
 from .protocol import (
     EOFPacketWrapper,
     FieldDescriptorPacket,
-    LoadLocalPacketWrapper,
     MysqlPacket,
     OKPacketWrapper,
     dump_packet,
@@ -65,6 +65,122 @@ TEXT_TYPES = {
 DEFAULT_CHARSET = "utf8mb4"
 
 MAX_PACKET_LEN = 2**24 - 1
+
+#: Default chunk size for LOAD DATA LOCAL INFILE payloads.
+LOCAL_INFILE_CHUNK_SIZE = 16 * 1024
+
+
+class LocalInfileSource:
+    """A one-shot byte source approved by the application for one import.
+
+    The MySQL server chooses the filename it asks for, but that name is never
+    used to open a local path.  The application must hand this object (or an
+    already opened binary file object) to the statement that is expected to
+    use ``LOAD DATA LOCAL INFILE``.  The source is consumed at most once: a
+    second request during the same result, or a request on a statement that
+    did not authorize one, is rejected.
+
+    :param file: An opened binary file object, or ``bytes``/``bytearray``/
+        ``memoryview`` containing already approved data.  Strings and path
+        objects are rejected because the driver must not turn a path into an
+        implicit file read.
+    :param max_bytes: Maximum number of payload bytes that may be sent for
+        this source.  ``None`` uses the connection's ``max_allowed_packet``.
+        Bytes beyond the budget are never written to the server.
+    :param close: Close ``file`` when the statement finishes.  This defaults
+        to ``True`` for :class:`LocalInfileSource`; raw file objects passed
+        directly to ``execute`` are left open for the caller to manage.
+    """
+
+    __slots__ = ("file", "max_bytes", "close", "_closed")
+
+    def __init__(self, file, *, max_bytes=None, close=True):
+        if isinstance(file, (bytes, bytearray, memoryview)):
+            file = io.BytesIO(bytes(file))
+        elif isinstance(file, (str, os.PathLike)):
+            raise TypeError(
+                "local_infile_source must be an opened binary file object or "
+                "bytes; a path would let the driver read an arbitrary file"
+            )
+        elif not hasattr(file, "read"):
+            raise TypeError("local_infile_source must have a read() method")
+        if max_bytes is not None and (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 0
+        ):
+            raise ValueError("max_bytes must be None or a non-negative integer")
+        self.file = file
+        self.max_bytes = max_bytes
+        self.close = bool(close)
+        self._closed = False
+
+    def read(self, size):
+        chunk = self.file.read(size)
+        if isinstance(chunk, str):
+            raise TypeError("local_infile_source must yield bytes, not str")
+        return chunk
+
+    def close_file(self):
+        if not self.close or self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self.file.close()
+
+
+class _LocalInfileTooLarge(Exception):
+    def __init__(self, limit):
+        self.limit = limit
+        super().__init__(limit)
+
+
+def _make_local_infile_source(source):
+    if source is None or isinstance(source, LocalInfileSource):
+        return source
+    return LocalInfileSource(source, close=False)
+
+
+def _send_local_source(source, conn):
+    """Write an authorized source in packets and enforce its byte budget."""
+    packet_size = min(conn.max_allowed_packet, LOCAL_INFILE_CHUNK_SIZE, MAX_PACKET_LEN)
+    if packet_size <= 0:
+        packet_size = 1
+    limits = [
+        value
+        for value in (source.max_bytes, conn._local_infile_max_bytes)
+        if value is not None
+    ]
+    limit = min(limits) if limits else max(conn.max_allowed_packet, 0)
+
+    sent = 0
+    while True:
+        remaining = limit - sent
+        if remaining == 0:
+            # Probe for overflow without ever writing past the budget.
+            extra = source.read(1)
+            if isinstance(extra, str):
+                raise TypeError("local_infile_source must yield bytes, not str")
+            if extra:
+                raise _LocalInfileTooLarge(limit)
+            if extra is None:
+                raise TypeError("local_infile_source.read() returned None")
+            return sent
+        read_size = min(packet_size, remaining)
+        chunk = source.read(read_size)
+        if chunk is None:
+            raise TypeError("local_infile_source.read() returned None")
+        if isinstance(chunk, str):
+            raise TypeError("local_infile_source must yield bytes, not str")
+        chunk = bytes(chunk)
+        if not chunk:
+            return sent
+        if len(chunk) > read_size:
+            raise ValueError(
+                "local_infile_source.read() returned more bytes than requested"
+            )
+        conn.write_packet(chunk)
+        sent += len(chunk)
 
 
 def _pack_int24(n):
@@ -147,9 +263,15 @@ class Connection:
     :param ssl_verify_identity: Set to true to check the server's identity.
     :param read_default_group: Group to read from in the configuration file.
     :param autocommit: Autocommit mode. None means use server default. (default: False)
-    :param local_infile: Boolean to enable the use of LOAD DATA LOCAL command. (default: False)
+    :param local_infile: Advertise and permit the use of LOAD DATA LOCAL command.
+        (default: False)  This flag alone never reads a local path: each import
+        must also authorize a source for its statement.
+    :param local_infile_max_bytes: Default byte budget for one imported source.
+        ``None`` uses ``max_allowed_packet``.  A source's own limit also
+        applies; the smaller limit wins.
     :param max_allowed_packet: Max size of packet sent to server in bytes. (default: 16MB)
-        Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
+        Also caps the data sent by a LOAD DATA LOCAL source when
+        ``local_infile_max_bytes`` is not specified.
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
         (default: False)
     :param auth_plugin_map: A dict of plugin names to a class that processes that plugin.
@@ -196,6 +318,7 @@ class Connection:
         read_default_group=None,
         autocommit=False,
         local_infile=False,
+        local_infile_max_bytes=None,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
         auth_plugin_map=None,
@@ -233,6 +356,16 @@ class Connection:
             )
 
         self._local_infile = bool(local_infile)
+        if local_infile_max_bytes is not None and (
+            not isinstance(local_infile_max_bytes, int)
+            or isinstance(local_infile_max_bytes, bool)
+            or local_infile_max_bytes < 0
+        ):
+            raise ValueError(
+                "local_infile_max_bytes must be None or a non-negative integer"
+            )
+        self._local_infile_max_bytes = local_infile_max_bytes
+        self._local_infile_source = None
         if self._local_infile:
             client_flag |= CLIENT.LOCAL_FILES
 
@@ -582,13 +715,31 @@ class Connection:
         return self.cursorclass(self)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
-    def query(self, sql, unbuffered=False):
+    def query(self, sql, unbuffered=False, local_infile_source=None):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
-        self._execute_command(COMMAND.COM_QUERY, sql)
-        self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        source = _make_local_infile_source(local_infile_source)
+        if source is not None and not self._local_infile:
+            source.close_file()
+            raise err.OperationalError(
+                CR.CR_LOAD_DATA_LOCAL_INFILE_REJECTED,
+                "Local file import is disabled; enable local_infile to use a source",
+            )
+        try:
+            # _execute_command drains any previous unbuffered result first.
+            # Bind the source only afterwards so a stale result cannot consume
+            # an authorization meant for the statement we are about to send.
+            self._execute_command(COMMAND.COM_QUERY, sql)
+            self._local_infile_source = source
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        finally:
+            # Authorization covers exactly this statement.  A source must
+            # never leak into the next result or the next query.
+            self._local_infile_source = None
+            if source is not None:
+                source.close_file()
         return self._affected_rows
 
     def next_result(self, unbuffered=False):
@@ -1344,25 +1495,115 @@ class MySQLResult:
 
     def _read_load_local_packet(self, first_packet):
         conn: Connection = self.connection
+        # The server picked this name, but it is only informational.  We never
+        # resolve it against the filesystem; only an application-approved
+        # source bound to this statement may be read.
         if not conn._local_infile:
-            raise RuntimeError(
-                "**WARN**: Received LOAD_LOCAL packet but local_infile option is false."
+            self._reject_local_infile(
+                conn,
+                CR.CR_LOAD_DATA_LOCAL_INFILE_REJECTED,
+                "LOAD DATA LOCAL INFILE refused: local_infile is disabled",
             )
-        load_packet = LoadLocalPacketWrapper(first_packet)
-        try:
-            _send_local_file(load_packet.filename, conn)
-        finally:
-            # send the empty packet to signify we are done sending data
-            conn.write_packet(b"")
-            ok_packet = conn._read_packet()
-            # If an error occurs while sending the file, exit here without handling
-            # the OK packet.
+            return
 
+        source = conn._local_infile_source
+        if source is None:
+            self._reject_local_infile(
+                conn,
+                CR.CR_LOAD_DATA_LOCAL_INFILE_REJECTED,
+                "LOAD DATA LOCAL INFILE refused: no source was approved for "
+                "this statement",
+            )
+            return
+
+        # One source authorizes exactly one import for this statement.  Clear
+        # it first so that even a repeat request below cannot reuse it.
+        conn._local_infile_source = None
+
+        try:
+            _send_local_source(source, conn)
+        except _LocalInfileTooLarge as exc:
+            self._abort_local_infile(
+                conn,
+                CR.CR_NET_PACKET_TOO_LARGE,
+                f"LOAD DATA LOCAL INFILE exceeded its {exc.limit} byte limit",
+            )
+            return
+        except Exception as exc:
+            self._abort_local_infile(
+                conn,
+                CR.CR_LOAD_DATA_LOCAL_INFILE_REJECTED,
+                f"LOAD DATA LOCAL INFILE source failed: {exc}",
+                cause=exc,
+            )
+            return
+
+        # Empty packet terminates the upload.  Its response is the only packet
+        # belonging to this statement; it must not be left to be read as some
+        # later query's result.
+        conn.write_packet(b"")
+        ok_packet = conn._read_packet()
+        if ok_packet.is_load_local_packet():
+            # A second file request is not covered by the single authorization.
+            # Refuse it and consume its own response before reporting.
+            self._reject_local_infile(
+                conn,
+                CR.CR_LOAD_DATA_LOCAL_INFILE_REJECTED,
+                "LOAD DATA LOCAL INFILE refused: a second file request is not "
+                "authorized by this statement",
+            )
+            return
         if not ok_packet.is_ok_packet():
+            conn._force_close()
             raise err.OperationalError(
-                CR.CR_COMMANDS_OUT_OF_SYNC, "Commands Out of Sync"
+                CR.CR_COMMANDS_OUT_OF_SYNC,
+                "Commands Out of Sync: unexpected packet after local infile upload",
             )
         self._read_ok_packet(ok_packet)
+
+    def _reject_local_infile(self, conn, code, message):
+        """Finish an upload we refuse, then report it without losing sync."""
+        self._finish_local_infile_exchange(conn, terminate=True)
+        raise err.OperationalError(code, message)
+
+    def _abort_local_infile(self, conn, code, message, cause=None):
+        """Stop an upload already in progress and keep the protocol in sync."""
+        self._finish_local_infile_exchange(conn, terminate=True)
+        exc = err.OperationalError(code, message)
+        if cause is not None:
+            exc.__cause__ = cause
+        raise exc
+
+    def _finish_local_infile_exchange(self, conn, terminate):
+        """Consume the packet that belongs to an ended import exchange.
+
+        Sending the empty terminator tells the server to stop waiting for
+        data; its reply must then be read here.  If the reply cannot be
+        consumed, the connection is closed so that no later query can read it
+        as its own result.  Server error packets are fully parsed before
+        ``_read_packet`` raises, so they count as consumed.  A transport
+        failure or packet-sequence error is re-raised: the connection is
+        already unusable and the caller must see the real reason.
+        """
+        try:
+            if terminate:
+                conn.write_packet(b"")
+        except Exception:
+            conn._force_close()
+            raise
+        try:
+            response = conn._read_packet()
+        except err.Error:
+            if not conn.open:
+                # Lost connection or protocol desync, not a server verdict.
+                raise
+            # A server error packet was fully parsed before the exception; it
+            # belongs to this exchange and must not be seen by the next query.
+            response = None
+        if response is not None and response.is_load_local_packet():
+            # The server asked for yet another file.  That exchange cannot be
+            # completed without another authorized source.
+            conn._force_close()
 
     def _check_packet_is_eof(self, packet):
         if not packet.is_eof_packet():
@@ -1497,22 +1738,3 @@ class MySQLResult:
         eof_packet = self.connection._read_packet()
         assert eof_packet.is_eof_packet(), "Protocol error, expecting EOF"
         self.description = tuple(description)
-
-
-def _send_local_file(filename: str, conn: Connection):
-    """Send data packets from the local file to the server"""
-    packet_size = min(conn.max_allowed_packet, 16 * 1024)
-
-    try:
-        with open(filename, "rb") as file:
-            # 16KB is efficient enough
-            while True:
-                chunk = file.read(packet_size)
-                if not chunk:
-                    break
-                conn.write_packet(chunk)
-    except OSError as e:
-        raise err.OperationalError(
-            ER.FILE_NOT_FOUND,
-            f"Can't open file '{filename}': {e}",
-        )

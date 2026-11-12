@@ -77,6 +77,7 @@ apilevel = "2.0"
 paramstyle = "pyformat"
 
 from . import connections
+from .connections import LocalInfileSource
 
 
 class DBAPISet(frozenset):
@@ -159,6 +160,7 @@ __all__ = [
     "IntegrityError",
     "InterfaceError",
     "InternalError",
+    "LocalInfileSource",
     "MySQLError",
     "NotSupportedError",
     "OperationalError",

@@ -13,6 +13,17 @@ the connection's SQL mode.
 
 See also: https://github.com/PyMySQL/PyMySQL/security/advisories/GHSA-m75w-33c4-7v8q
 
+### LOAD DATA LOCAL source authorization
+
+`LOAD DATA LOCAL INFILE` no longer opens the path named in the server's file
+request. Each import must be approved for its statement by passing a
+`pymysql.LocalInfileSource` (or an opened binary file object) to
+`Cursor.execute(..., local_infile_source=...)`. Sources are one-shot, may
+send at most `max_bytes` (also capped by `local_infile_max_bytes` /
+`max_allowed_packet`), and refusals, read errors, and over-budget uploads
+consume the upload response so the connection stays in sync. See
+`docs/source/user/examples.rst`.
+
 ### Other changes
 
 * `ssl_verify_identity=True` now requires server certificate verification,
