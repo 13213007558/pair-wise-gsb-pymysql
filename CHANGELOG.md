@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+### Other changes
+
+* Add `Connection.reset_session()` for returning a connection to a pool. It
+  drains unread streaming results, sends `COM_RESET_CONNECTION`, and re-applies
+  the connection's declared baseline (database, character set/collation,
+  `sql_mode`, `init_command` and `autocommit`). The returned
+  `ResetSessionResult` is reusable only if every step succeeded; otherwise the
+  connection is closed and must be discarded.
+
 ## v1.2.4 (security fix)
 
 Release date: 2026-11-09

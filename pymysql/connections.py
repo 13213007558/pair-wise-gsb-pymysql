@@ -67,6 +67,45 @@ DEFAULT_CHARSET = "utf8mb4"
 MAX_PACKET_LEN = 2**24 - 1
 
 
+class ResetSessionResult:
+    """Outcome of :meth:`Connection.reset_session`.
+
+    ``reusable`` is true only when every step of the reset completed: the
+    previous result set was consumed, the server acknowledged the session
+    reset, and the connection's declared initialization baseline was re-applied
+    successfully.  A pool must not return a connection to its idle set unless
+    this flag is true.
+    """
+
+    __slots__ = (
+        "reusable",
+        "drained_results",
+        "reset_supported",
+        "baseline",
+        "error",
+    )
+
+    def __init__(
+        self, *, reusable, drained_results, reset_supported, baseline, error=None
+    ):
+        self.reusable = reusable
+        self.drained_results = drained_results
+        self.reset_supported = reset_supported
+        self.baseline = baseline
+        self.error = error
+
+    def __bool__(self):
+        return self.reusable
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(reusable={self.reusable!r}, "
+            f"drained_results={self.drained_results!r}, "
+            f"reset_supported={self.reset_supported!r}, "
+            f"error={self.error!r})"
+        )
+
+
 def _pack_int24(n):
     return struct.pack("<I", n)[:3]
 
@@ -351,6 +390,16 @@ class Connection:
         # specified autocommit mode. None means use server default.
         self.autocommit_mode = autocommit
 
+        # The session state a connection must be returned to before it may be
+        # reused from a pool. These values are the connection's declared
+        # baseline, captured before the initial connection is established.
+        self._baseline_database = database
+        self._baseline_charset = self.charset
+        self._baseline_collation = collation
+        self._baseline_sql_mode = sql_mode
+        self._baseline_init_command = init_command
+        self._baseline_autocommit = autocommit
+
         if conv is None:
             conv = converters.conversions
 
@@ -522,6 +571,184 @@ class Connection:
         result = MySQLResult(self)
         result.read()
         return result.rows
+
+    def _drain_pending_results(self):
+        """Consume results the application left unread on the socket.
+
+        This is required before sending COM_RESET_CONNECTION: the reset is a
+        new command, and the server will not look at it while rows, an EOF
+        packet or a following result set are still in flight.  Unlike
+        ``_execute_command`` this never silently starts a new command on top
+        of a stale stream, and it does not swallow timeouts: a stream we cannot
+        finish leaves the connection in an unknown protocol state.
+
+        :return: True if at least one unread row or result set was consumed.
+        """
+        drained = False
+        result = self._result
+        if result is None:
+            return drained
+
+        while True:
+            while result.unbuffered_active:
+                packet = self._read_packet()
+                if result._check_packet_is_eof(packet):
+                    result.unbuffered_active = False
+                # A data row is intentionally not converted: it is discarded.
+                drained = True
+
+            if not result.has_next:
+                break
+
+            # Drain any additional result sets unbuffered so a large trailing
+            # result cannot be materialized just to be thrown away.
+            self.next_result(unbuffered=True)
+            result = self._result
+            drained = True
+            if result is None:
+                break
+
+        if result is not None:
+            result.connection = None
+        self._result = None
+        self._affected_rows = 0
+        return drained
+
+    def _restore_session_baseline(self):
+        """Re-apply the initialization declared when the connection was built."""
+        if self._baseline_database is not None:
+            self.select_db(self._baseline_database)
+
+        self.set_character_set(self._baseline_charset, self._baseline_collation)
+
+        if self._baseline_sql_mode is not None:
+            c = self.cursor()
+            c.execute("SET sql_mode=%s", (self._baseline_sql_mode,))
+            c.close()
+
+        if self._baseline_init_command is not None:
+            c = self.cursor()
+            c.execute(self._baseline_init_command)
+            c.close()
+
+        self.autocommit_mode = self._baseline_autocommit
+        if self._baseline_autocommit is not None:
+            if bool(self._baseline_autocommit) != self.get_autocommit():
+                self._send_autocommit_mode()
+            # Do not trust that the server applied the setting: an OK packet
+            # with the wrong session flags means the declared baseline was not
+            # reached, so the connection must not be pooled.
+            if bool(self._baseline_autocommit) != self.get_autocommit():
+                raise err.OperationalError(
+                    CR.CR_COMMANDS_OUT_OF_SYNC,
+                    "autocommit state was not restored to the declared baseline",
+                )
+
+    def reset_session(self):
+        """Reset the server-side session before returning a pooled connection.
+
+        ``COM_RESET_CONNECTION`` rolls back the active transaction, releases
+        locks, drops temporary tables, resets session and user variables and
+        discards prepared statements.  That is strictly more than
+        ``rollback()``: a rollback only ends the transaction and leaves user
+        variables, session settings and temporary objects behind.
+
+        The driver first consumes any result set the application did not read
+        completely, then resets the server, then re-applies the baseline that
+        was declared when the connection was constructed (database, character
+        set/collation, ``sql_mode``, ``init_command`` and ``autocommit``).
+
+        On success the same :class:`ResetSessionResult` has ``reusable=True``
+        and the connection may be handed to the next pool borrower.  On any
+        failure -- an unread stream that cannot be finished, a server that does
+        not understand the command, a dropped connection, or a baseline
+        initialization that fails -- the connection is closed and can never be
+        reused; the result has ``reusable=False``.  A pool must check
+        ``reusable`` (or truthiness) and discard the connection otherwise.
+
+        :return: :class:`ResetSessionResult`
+        """
+        if not self._sock:
+            return ResetSessionResult(
+                reusable=False,
+                drained_results=False,
+                reset_supported=None,
+                baseline=self._declared_baseline(),
+                error=err.InterfaceError(0, "Connection is closed"),
+            )
+
+        baseline = self._declared_baseline()
+        drained = False
+        reset_supported = None
+        phase = "drain"
+
+        try:
+            drained = self._drain_pending_results()
+
+            phase = "reset"
+            self._execute_command(COMMAND.COM_RESET_CONNECTION, b"")
+            self._read_ok_packet()
+            reset_supported = True
+            self._affected_rows = 0
+            self._result = None
+
+            phase = "baseline"
+            self._restore_session_baseline()
+            self._affected_rows = 0
+            self._result = None
+        except Exception as exc:
+            # Only an error returned by the reset command itself means the
+            # server does not implement COM_RESET_CONNECTION. An error during
+            # the following baseline initialization must not be reported that
+            # way, even if it happens to have the same errno.
+            if (
+                phase == "reset"
+                and getattr(exc, "args", (None,))[0] == ER.UNKNOWN_COM_ERROR
+            ):
+                reset_supported = False
+            self._discard_failed_reset()
+            return ResetSessionResult(
+                reusable=False,
+                drained_results=drained,
+                reset_supported=reset_supported,
+                baseline=baseline,
+                error=exc,
+            )
+        except BaseException:
+            # Never leave a half-reset session reachable after an interrupt.
+            self._discard_failed_reset()
+            raise
+
+        return ResetSessionResult(
+            reusable=True,
+            drained_results=drained,
+            reset_supported=reset_supported,
+            baseline=baseline,
+        )
+
+    def _discard_failed_reset(self):
+        """Make a connection unusable after any failed reset step.
+
+        The stream is in an unknown state or an initialization step failed.
+        Closing without QUIT is the only safe outcome: the next borrower must
+        never receive this session.
+        """
+        if self._result is not None:
+            self._result.unbuffered_active = False
+            self._result.connection = None
+        self._result = None
+        self._affected_rows = 0
+        self._force_close()
+
+    def _declared_baseline(self):
+        return {
+            "database": self._baseline_database,
+            "charset": self._baseline_charset,
+            "collation": self._baseline_collation,
+            "sql_mode": self._baseline_sql_mode,
+            "init_command": self._baseline_init_command,
+            "autocommit": self._baseline_autocommit,
+        }
 
     def select_db(self, db):
         """
