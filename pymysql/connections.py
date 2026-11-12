@@ -152,6 +152,16 @@ class Connection:
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
         (default: False)
+    :param auth_max_bytes: Cumulative byte budget for the handshake and
+        authentication phase. Counts every byte read from the server until
+        authentication completes, including fragmented packets and reads
+        triggered by custom authentication plugins. The connection is aborted
+        when the budget is exceeded. None means unlimited. (default: None)
+    :param auth_max_roundtrips: Maximum number of server packets read during
+        the handshake and authentication phase. The connection is aborted when
+        the budget is exceeded. None means unlimited. (default: None)
+        Both budgets only apply to the handshake/authentication phase; normal
+        query traffic is not limited by them.
     :param auth_plugin_map: A dict of plugin names to a class that processes that plugin.
         The class will take the Connection object as the argument to the constructor.
         The class needs an authenticate method taking an authentication packet as
@@ -173,6 +183,9 @@ class Connection:
     _auth_plugin_name = ""
     _closed = False
     _secure = False
+    _auth_phase = False
+    _auth_bytes_read = 0
+    _auth_roundtrips = 0
 
     def __init__(
         self,
@@ -198,6 +211,8 @@ class Connection:
         local_infile=False,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
+        auth_max_bytes=None,
+        auth_max_roundtrips=None,
         auth_plugin_map=None,
         read_timeout=None,
         write_timeout=None,
@@ -329,6 +344,12 @@ class Connection:
         if write_timeout is not None and write_timeout <= 0:
             raise ValueError("write_timeout should be > 0")
         self._write_timeout = write_timeout
+        if auth_max_bytes is not None and auth_max_bytes <= 0:
+            raise ValueError("auth_max_bytes should be > 0")
+        self._auth_max_bytes = auth_max_bytes
+        if auth_max_roundtrips is not None and auth_max_roundtrips <= 0:
+            raise ValueError("auth_max_roundtrips should be > 0")
+        self._auth_max_roundtrips = auth_max_roundtrips
 
         self.charset = charset or DEFAULT_CHARSET
         self.collation = collation
@@ -708,8 +729,15 @@ class Connection:
             self._rfile = sock.makefile("rb")
             self._next_seq_id = 0
 
+            # The handshake/authentication budgets only cover the connection
+            # phase. Query traffic after authentication follows its own rules.
+            self._auth_phase = True
+            self._auth_bytes_read = 0
+            self._auth_roundtrips = 0
+
             self._get_server_information()
             self._request_authentication()
+            self._auth_phase = False
 
             # Send "SET NAMES" query on init for:
             # - Ensure charset (and collation) is set to the server.
@@ -784,6 +812,20 @@ class Connection:
             self._sock.settimeout(self._read_timeout)
             self._current_timeout = self._read_timeout
 
+        if self._auth_phase:
+            self._auth_roundtrips += 1
+            if (
+                self._auth_max_roundtrips is not None
+                and self._auth_roundtrips > self._auth_max_roundtrips
+            ):
+                self._force_close()
+                raise err.OperationalError(
+                    CR.CR_SERVER_HANDSHAKE_ERR,
+                    "Authentication phase exceeded roundtrip budget: "
+                    f"{self._auth_roundtrips} packets read, "
+                    f"budget is {self._auth_max_roundtrips}",
+                )
+
         buff = []
         while True:
             packet_header = self._read_bytes(4)
@@ -844,6 +886,19 @@ class Connection:
             raise err.OperationalError(
                 CR.CR_SERVER_LOST, "Lost connection to MySQL server during query"
             )
+        if self._auth_phase:
+            self._auth_bytes_read += len(data)
+            if (
+                self._auth_max_bytes is not None
+                and self._auth_bytes_read > self._auth_max_bytes
+            ):
+                self._force_close()
+                raise err.OperationalError(
+                    CR.CR_SERVER_HANDSHAKE_ERR,
+                    "Authentication phase exceeded byte budget: "
+                    f"{self._auth_bytes_read} bytes read, "
+                    f"budget is {self._auth_max_bytes}",
+                )
         return data
 
     def _write_bytes(self, data):
