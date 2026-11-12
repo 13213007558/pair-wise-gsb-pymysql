@@ -13,7 +13,7 @@ import sys
 import traceback
 import warnings
 
-from . import VERSION_STRING, _auth, converters, err
+from . import VERSION_STRING, _auth, converters, err, safeerr
 from .charset import charset_by_id, charset_by_name
 from .constants import CLIENT, COMMAND, CR, ER, FIELD_TYPE, SERVER_STATUS
 from .cursors import Cursor
@@ -152,6 +152,12 @@ class Connection:
         Only used to limit size of "LOAD LOCAL INFILE" data packet smaller than default (16KB).
     :param defer_connect: Don't explicitly connect on construction - wait for connect call.
         (default: False)
+    :param safe_errors: If True, replace server-supplied error messages with a
+        generic, data-free projection (see ``pymysql.safeerr``). The exception
+        class, errno, sqlstate and a retryable flag are preserved; the original
+        server message is only written to the internal diagnostic log.
+        If False (default), keep the historical behavior of exposing server
+        messages verbatim. (default: False)
     :param auth_plugin_map: A dict of plugin names to a class that processes that plugin.
         The class will take the Connection object as the argument to the constructor.
         The class needs an authenticate method taking an authentication packet as
@@ -198,6 +204,7 @@ class Connection:
         local_infile=False,
         max_allowed_packet=16 * 1024 * 1024,
         defer_connect=False,
+        safe_errors=False,
         auth_plugin_map=None,
         read_timeout=None,
         write_timeout=None,
@@ -362,6 +369,7 @@ class Connection:
         self.max_allowed_packet = max_allowed_packet
         self._auth_plugin_map = auth_plugin_map or {}
         self.server_public_key = server_public_key
+        self._safe_errors = bool(safe_errors)
 
         self._connect_attrs = {
             "_client_name": "pymysql",
@@ -474,7 +482,11 @@ class Connection:
         return bool(self.server_status & SERVER_STATUS.SERVER_STATUS_AUTOCOMMIT)
 
     def _read_ok_packet(self):
-        pkt = self._read_packet()
+        try:
+            pkt = self._read_packet()
+        except err.DatabaseError as e:
+            self._maybe_project_error(e, "execute")
+            raise
         if not pkt.is_ok_packet():
             raise err.OperationalError(
                 CR.CR_COMMANDS_OUT_OF_SYNC,
@@ -582,17 +594,36 @@ class Connection:
         return self.cursorclass(self)
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
+    def _maybe_project_error(self, exc, phase):
+        """Raise the safely projected version of *exc* if safe_errors is on.
+
+        The projected exception suppresses the original one (``from None``)
+        so the server-supplied message cannot leak through traceback
+        formatting.  With safe_errors disabled this returns and the caller
+        re-raises the original exception unchanged.
+        """
+        if self._safe_errors and isinstance(exc, err.DatabaseError):
+            raise safeerr.project_error(exc, phase) from None
+
     def query(self, sql, unbuffered=False):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
-        self._execute_command(COMMAND.COM_QUERY, sql)
-        self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        try:
+            self._execute_command(COMMAND.COM_QUERY, sql)
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        except err.DatabaseError as e:
+            self._maybe_project_error(e, "execute")
+            raise
         return self._affected_rows
 
     def next_result(self, unbuffered=False):
-        self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        try:
+            self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        except err.DatabaseError as e:
+            self._maybe_project_error(e, "execute")
+            raise
         return self._affected_rows
 
     def affected_rows(self):
@@ -751,7 +782,10 @@ class Connection:
                 exc.traceback = traceback.format_exc()
                 if DEBUG:
                     print(exc.traceback)
+                self._maybe_project_error(exc, "connect")
                 raise exc
+
+            self._maybe_project_error(e, "connect")
 
             # If e is neither DatabaseError or IOError, It's a bug.
             # But raising AssertionError hides original error.
@@ -899,25 +933,29 @@ class Connection:
 
         packet_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
 
-        # tiny optimization: build first packet manually instead of
-        # calling self..write_packet()
-        prelude = struct.pack("<iB", packet_size, command)
-        packet = prelude + sql[: packet_size - 1]
-        self._write_bytes(packet)
-        if DEBUG:
-            dump_packet(packet)
-        self._next_seq_id = 1
+        try:
+            # tiny optimization: build first packet manually instead of
+            # calling self..write_packet()
+            prelude = struct.pack("<iB", packet_size, command)
+            packet = prelude + sql[: packet_size - 1]
+            self._write_bytes(packet)
+            if DEBUG:
+                dump_packet(packet)
+            self._next_seq_id = 1
 
-        if packet_size < MAX_PACKET_LEN:
-            return
+            if packet_size < MAX_PACKET_LEN:
+                return
 
-        sql = sql[packet_size - 1 :]
-        while True:
-            packet_size = min(MAX_PACKET_LEN, len(sql))
-            self.write_packet(sql[:packet_size])
-            sql = sql[packet_size:]
-            if not sql and packet_size < MAX_PACKET_LEN:
-                break
+            sql = sql[packet_size - 1 :]
+            while True:
+                packet_size = min(MAX_PACKET_LEN, len(sql))
+                self.write_packet(sql[:packet_size])
+                sql = sql[packet_size:]
+                if not sql and packet_size < MAX_PACKET_LEN:
+                    break
+        except err.DatabaseError as e:
+            self._maybe_project_error(e, "execute")
+            raise
 
     def _request_authentication(self):
         # https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse
@@ -1388,7 +1426,11 @@ class MySQLResult:
             return
 
         # EOF
-        packet = self.connection._read_packet()
+        try:
+            packet = self.connection._read_packet()
+        except err.DatabaseError as e:
+            self.connection._maybe_project_error(e, "fetch")
+            raise
         if self._check_packet_is_eof(packet):
             self.unbuffered_active = False
             self.connection = None
@@ -1417,6 +1459,10 @@ class MySQLResult:
                     self.connection = None
                     return
 
+                self.connection._maybe_project_error(e, "fetch")
+                raise
+            except err.DatabaseError as e:
+                self.connection._maybe_project_error(e, "fetch")
                 raise
 
             if self._check_packet_is_eof(packet):
